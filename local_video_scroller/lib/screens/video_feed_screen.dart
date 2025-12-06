@@ -31,55 +31,46 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
   }
 
   Future<void> _checkPermissionAndLoadVideos() async {
-    // Check for storage permission
-    var status = await Permission.storage.status;
-    
-    if (!status.isGranted) {
-      // Request permission
-      status = await Permission.storage.request();
-      
-      if (!status.isGranted) {
-        // Show dialog to explain why permission is needed
-        _showPermissionDialog();
-        return;
-      }
-    }
+  // On Android 13+, we request the specific 'videos' permission.
+  // The permission_handler package handles this mapping for us.
+  var status = await Permission.videos.request();
 
+  // For older Androids (or if the user denies the new permission),
+  // we can fall back to the old storage permission.
+  if (status.isDenied) {
+    status = await Permission.storage.request();
+  }
+
+  if (status.isGranted) {
     setState(() {
       _hasPermission = true;
     });
-
     await _loadVideos();
+  } else {
+    // If permission is still denied, show a message.
+    _showPermissionDeniedDialog();
   }
+}
 
-  void _showPermissionDialog() {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('Storage Permission Required'),
-          content: const Text(
-            'This app needs access to your storage to load and play video files. Please grant storage permission to continue.',
+void _showPermissionDeniedDialog() {
+  showDialog(
+    context: context,
+    builder: (BuildContext context) {
+      return AlertDialog(
+        title: const Text('Permission Required'),
+        content: const Text(
+          'This app needs access to your videos to function. Please grant the permission in settings.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                openAppSettings(); // Open app settings to enable permission
-              },
-              child: const Text('Settings'),
-            ),
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: const Text('Cancel'),
-            ),
-          ],
-        );
-      },
-    );
-  }
+        ],
+      );
+    },
+  );
+}
 
   Future<void> _loadVideos() async {
     setState(() {

@@ -6,39 +6,48 @@ class VideoService {
   static const String _defaultDirectory = 'BrokeBinge';
 
   Future<Directory> getVideoDirectory() async {
-    Directory? directory;
-    
-    if (Platform.isAndroid) {
-      directory = await getExternalStorageDirectory();
-      if (directory != null) {
-        // Navigate up to the parent directory to access external storage
-        final parentDir = directory.parent;
-        final targetDir = Directory('${parentDir.path}/$_defaultDirectory');
-        
-        if (!await targetDir.exists()) {
-          await targetDir.create(recursive: true);
-        }
-        
-        return targetDir;
+  if (Platform.isAndroid) {
+    // This gets the standard Movies directory for the app.
+    // e.g., /storage/emulated/0/Movies/local_video_scroller
+    final directory = await getExternalStorageDirectories(type: StorageDirectory.movies);
+    if (directory != null && directory.isNotEmpty) {
+      // We will create our 'BrokeBinge' folder inside the Movies directory.
+      final targetDir = Directory('${directory.first.path}/$_defaultDirectory');
+      
+      if (!await targetDir.exists()) {
+        await targetDir.create(recursive: true);
       }
+      
+      print('Looking for videos in: ${targetDir.path}');
+      return targetDir;
     }
-    
-    // Fallback to app documents directory
-    final appDir = await getApplicationDocumentsDirectory();
-    final targetDir = Directory('${appDir.path}/$_defaultDirectory');
-    
-    if (!await targetDir.exists()) {
-      await targetDir.create(recursive: true);
-    }
-    
-    return targetDir;
   }
+  
+  // Fallback for other platforms
+  final appDir = await getApplicationDocumentsDirectory();
+  final targetDir = Directory('${appDir.path}/$_defaultDirectory');
+  
+  if (!await targetDir.exists()) {
+    await targetDir.create(recursive: true);
+  }
+  
+  return targetDir;
+}
 
   Future<List<VideoModel>> getAllVideos() async {
     try {
       final directory = await getVideoDirectory();
+      
+      // Check if the directory actually exists before trying to list files
+      if (!await directory.exists()) {
+        print('Error: Directory ${directory.path} does not exist.');
+        return [];
+      }
+
       final files = await directory.list().where((entity) => 
           entity is File && entity.path.endsWith('.mp4')).cast<File>().toList();
+      
+      print('Found ${files.length} .mp4 files.'); // Add this for debugging
       
       // Sort files by name to ensure proper order
       files.sort((a, b) => a.path.compareTo(b.path));
