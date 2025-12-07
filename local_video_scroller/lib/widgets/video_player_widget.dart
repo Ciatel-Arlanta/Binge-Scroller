@@ -33,9 +33,19 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
   @override
   void didUpdateWidget(VideoPlayerWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
+    
+    // If the video file changed, reload everything
     if (oldWidget.video.path != widget.video.path) {
       _disposeController();
       _initializeVideo();
+    } 
+    // If only the autoPlay flag changed (user scrolled), handle play/pause
+    else if (oldWidget.autoPlay != widget.autoPlay) {
+      if (widget.autoPlay) {
+        _controller?.play();
+      } else {
+        _controller?.pause();
+      }
     }
   }
 
@@ -43,9 +53,14 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
     try {
       _controller = VideoPlayerController.file(
         File(widget.video.path),
+        // Add this option to ensure audio mixes correctly with the system
+        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true), 
       );
 
       await _controller!.initialize();
+      
+      // FIX: Explicitly set volume to maximum
+      await _controller!.setVolume(1.0); 
 
       _controller!.addListener(() {
         if (_controller!.value.position >= _controller!.value.duration && widget.onVideoEnd != null) {
