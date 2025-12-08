@@ -1,184 +1,93 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
 import 'package:preload_page_view/preload_page_view.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import '../models/video_model.dart';
-import '../services/video_service.dart';
+import 'package:permission_handler/permission_handler.dart';
+import '../providers/video_state_provider.dart';
 import '../widgets/video_player_widget.dart';
 
 class VideoFeedScreen extends StatefulWidget {
   const VideoFeedScreen({Key? key}) : super(key: key);
 
   @override
-  _VideoFeedScreenState createState() => _VideoFeedScreenState();
+  State<VideoFeedScreen> createState() => _VideoFeedScreenState();
 }
 
 class _VideoFeedScreenState extends State<VideoFeedScreen> {
-  final VideoService _videoService = VideoService();
-  List<VideoModel> _allVideos = [];
-  bool _isLoading = true;
+  // We don't initialize the controller in initState anymore.
+  // We initialize it only after we know the start index from the provider.
+  PreloadPageController? _pageController;
   bool _hasPermission = false;
-  int _currentIndex = 0;
-  late PreloadPageController _pageController;
 
   @override
   void initState() {
     super.initState();
-    _pageController = PreloadPageController();
-    _checkPermissionAndLoadVideos();
-    _loadLastWatchedVideo();
+    _checkPermissions();
   }
 
-  Future<void> _checkPermissionAndLoadVideos() async {
-  // On Android 13+, we request the specific 'videos' permission.
-  // The permission_handler package handles this mapping for us.
-  var status = await Permission.videos.request();
+  Future<void> _checkPermissions() async {
+    // On Android 13+, we request the specific 'videos' permission.
+    var status = await Permission.videos.request();
 
-  // For older Androids (or if the user denies the new permission),
-  // we can fall back to the old storage permission.
-  if (status.isDenied) {
-    status = await Permission.storage.request();
+    // For older Androids, fallback to storage.
+    if (status.isDenied) {
+      status = await Permission.storage.request();
+    }
+
+    if (status.isGranted) {
+      setState(() {
+        _hasPermission = true;
+      });
+      // Permission granted, the Provider is likely already loading in background
+      // because it was initialized in main.dart.
+    } else {
+      _showPermissionDeniedDialog();
+    }
   }
 
-  if (status.isGranted) {
-    setState(() {
-      _hasPermission = true;
-    });
-    await _loadVideos();
-  } else {
-    // If permission is still denied, show a message.
-    _showPermissionDeniedDialog();
-  }
-}
-
-void _showPermissionDeniedDialog() {
-  showDialog(
-    context: context,
-    builder: (BuildContext context) {
-      return AlertDialog(
-        title: const Text('Permission Required'),
-        content: const Text(
-          'This app needs access to your videos to function. Please grant the permission in settings.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('OK'),
+  void _showPermissionDeniedDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Permission Required'),
+          content: const Text(
+            'This app needs access to your videos to function. Please grant the permission in settings.',
           ),
-        ],
-      );
-    },
-  );
-}
-
-  Future<void> _loadVideos() async {
-    setState(() {
-      _isLoading = true;
-    });
-
-    try {
-      final videos = await _videoService.getAllVideos();
-      setState(() {
-        _allVideos = videos;
-        _isLoading = false;
-      });
-    } catch (e) {
-      print('Error loading videos: $e');
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _loadLastWatchedVideo() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final lastWatchedPath = prefs.getString('last_watched_file_name');
-      
-      if (lastWatchedPath != null && _allVideos.isNotEmpty) {
-        final index = _allVideos.indexWhere((video) => video.path == lastWatchedPath);
-        if (index != -1) {
-          setState(() {
-            _currentIndex = index;
-          });
-          
-          // Scroll to the last watched video
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            _pageController.animateToPage(
-              _currentIndex,
-              duration: const Duration(milliseconds: 300),
-              curve: Curves.easeInOut,
-            );
-          });
-        }
-      }
-    } catch (e) {
-      print('Error loading last watched video: $e');
-    }
-  }
-
-  Future<void> _saveLastWatchedVideo(VideoModel video) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('last_watched_file_name', video.path);
-    } catch (e) {
-      print('Error saving last watched video: $e');
-    }
-  }
-
-  void _onPageChanged(int index) {
-    if (index < 0 || index >= _allVideos.length) return;
-    
-    setState(() {
-      _currentIndex = index;
-    });
-    
-    _saveLastWatchedVideo(_allVideos[index]);
-  }
-
-  void _onVideoEnd() {
-    // Auto-advance to next video
-    if (_currentIndex < _allVideos.length - 1) {
-      _pageController.nextPage(
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeInOut,
-      );
-    }
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
   void dispose() {
-    _pageController.dispose();
+    _pageController?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    // 1. If permission is denied, show the placeholder UI
     if (!_hasPermission) {
       return Scaffold(
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(
-                Icons.folder_off,
-                size: 100,
-                color: Colors.grey,
-              ),
+              const Icon(Icons.folder_off, size: 100, color: Colors.grey),
               const SizedBox(height: 16),
               const Text(
                 'Storage Permission Required',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Please grant storage permission to load videos',
-                textAlign: TextAlign.center,
-              ),
               const SizedBox(height: 24),
               ElevatedButton(
-                onPressed: _checkPermissionAndLoadVideos,
+                onPressed: _checkPermissions,
                 child: const Text('Grant Permission'),
               ),
             ],
@@ -187,74 +96,77 @@ void _showPermissionDeniedDialog() {
       );
     }
 
-    if (_isLoading) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const CircularProgressIndicator(),
-              const SizedBox(height: 16),
-              Text(
-                'Loading videos from ${_videoService.getVideoDirectory()}',
-                textAlign: TextAlign.center,
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (_allVideos.isEmpty) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(
-                Icons.video_library_outlined,
-                size: 100,
-                color: Colors.grey,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'No Videos Found',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Please add videos to the BrokeBinge folder',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: _loadVideos,
-                child: const Text('Refresh'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    return Scaffold(
-      body: PreloadPageView.builder(
-        controller: _pageController,
-        scrollDirection: Axis.vertical,
-        itemCount: _allVideos.length,
-        onPageChanged: _onPageChanged,
-        preloadPagesCount: 2, // Preload next and previous pages
-        itemBuilder: (context, index) {
-          final video = _allVideos[index];
-          final isCurrentPage = index == _currentIndex;
-          
-          return VideoPlayerWidget(
-            video: video,
-            autoPlay: isCurrentPage,
-            onVideoEnd: isCurrentPage ? _onVideoEnd : null,
+    // 2. Use Consumer to listen to the VideoStateProvider
+    return Consumer<VideoStateProvider>(
+      builder: (context, videoState, child) {
+        // A. Show Loading Indicator while fetching files/prefs
+        if (videoState.isLoading) {
+          return const Scaffold(
+            backgroundColor: Colors.black,
+            body: Center(child: CircularProgressIndicator()),
           );
-        },
-      ),
+        }
+
+        // B. Show Empty State if no videos found
+        if (videoState.videos.isEmpty) {
+          return Scaffold(
+            backgroundColor: Colors.black,
+            body: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: const [
+                  Icon(Icons.videocam_off, size: 64, color: Colors.grey),
+                  SizedBox(height: 16),
+                  Text(
+                    "No videos found in BrokeBinge folder",
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        // C. Initialize Controller ONCE with the saved index
+        // The ??= operator ensures we only create it if it's currently null
+        _pageController ??= PreloadPageController(
+          initialPage: videoState.currentIndex,
+          viewportFraction: 1.0,
+        );
+
+        return Scaffold(
+          backgroundColor: Colors.black,
+          body: PreloadPageView.builder(
+            controller: _pageController,
+            scrollDirection: Axis.vertical,
+            itemCount: videoState.videos.length,
+            preloadPagesCount: 2, // Keeps prev/next video ready in memory
+            onPageChanged: (index) {
+              // Save the new index to state/prefs via Provider
+              videoState.updateIndex(index);
+            },
+            itemBuilder: (context, index) {
+              final video = videoState.videos[index];
+              // Check against the Provider's index for auto-play logic
+              final isCurrent = index == videoState.currentIndex;
+
+              return VideoPlayerWidget(
+                video: video,
+                autoPlay: isCurrent,
+                onVideoEnd: () {
+                  // Auto-scroll logic
+                  if (index < videoState.videos.length - 1) {
+                    _pageController?.nextPage(
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeInOut,
+                    );
+                  }
+                },
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }
