@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:preload_page_view/preload_page_view.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -12,33 +13,60 @@ class VideoFeedScreen extends StatefulWidget {
   State<VideoFeedScreen> createState() => _VideoFeedScreenState();
 }
 
-class _VideoFeedScreenState extends State<VideoFeedScreen> {
-  // We don't initialize the controller in initState anymore.
-  // We initialize it only after we know the start index from the provider.
+class _VideoFeedScreenState extends State<VideoFeedScreen> with WidgetsBindingObserver {
   PreloadPageController? _pageController;
   bool _hasPermission = false;
+  bool _isAppInBackground = false;
 
   @override
   void initState() {
     super.initState();
     _checkPermissions();
+    // Add page visibility listener
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pageController?.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final videoState = Provider.of<VideoStateProvider>(context, listen: false);
+    
+    switch (state) {
+      case AppLifecycleState.paused:
+        _isAppInBackground = true;
+        // Pause all videos when app goes to background
+        // This will be handled by the VideoPlayerWidget's didUpdateWidget method
+        // We temporarily set a flag to indicate app is in background
+        break;
+      case AppLifecycleState.resumed:
+        _isAppInBackground = false;
+        // Resume current video when app comes to foreground
+        // Trigger a rebuild to update the video player widget
+        setState(() {});
+        break;
+      case AppLifecycleState.detached:
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+        break;
+    }
   }
 
   Future<void> _checkPermissions() async {
-    // On Android 13+, we request the specific 'videos' permission.
     var status = await Permission.videos.request();
-
-    // For older Androids, fallback to storage.
     if (status.isDenied) {
       status = await Permission.storage.request();
     }
-
     if (status.isGranted) {
       setState(() {
         _hasPermission = true;
       });
-      // Permission granted, the Provider is likely already loading in background
-      // because it was initialized in main.dart.
     } else {
       _showPermissionDeniedDialog();
     }
@@ -65,14 +93,7 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
   }
 
   @override
-  void dispose() {
-    _pageController?.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    // 1. If permission is denied, show the placeholder UI
     if (!_hasPermission) {
       return Scaffold(
         body: Center(
@@ -96,10 +117,8 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
       );
     }
 
-    // 2. Use Consumer to listen to the VideoStateProvider
     return Consumer<VideoStateProvider>(
       builder: (context, videoState, child) {
-        // A. Show Loading Indicator while fetching files/prefs
         if (videoState.isLoading) {
           return const Scaffold(
             backgroundColor: Colors.black,
@@ -107,7 +126,6 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
           );
         }
 
-        // B. Show Empty State if no videos found
         if (videoState.videos.isEmpty) {
           return Scaffold(
             backgroundColor: Colors.black,
@@ -127,8 +145,6 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
           );
         }
 
-        // C. Initialize Controller ONCE with the saved index
-        // The ??= operator ensures we only create it if it's currently null
         _pageController ??= PreloadPageController(
           initialPage: videoState.currentIndex,
           viewportFraction: 1.0,
@@ -140,21 +156,20 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
             controller: _pageController,
             scrollDirection: Axis.vertical,
             itemCount: videoState.videos.length,
-            preloadPagesCount: 2, // Keeps prev/next video ready in memory
+            preloadPagesCount: 2,
             onPageChanged: (index) {
-              // Save the new index to state/prefs via Provider
               videoState.updateIndex(index);
             },
             itemBuilder: (context, index) {
               final video = videoState.videos[index];
-              // Check against the Provider's index for auto-play logic
               final isCurrent = index == videoState.currentIndex;
-
+              // Only play if it's the current video AND app is not in background
+              final shouldAutoPlay = isCurrent && !_isAppInBackground;
+              
               return VideoPlayerWidget(
                 video: video,
-                autoPlay: isCurrent,
+                autoPlay: shouldAutoPlay,
                 onVideoEnd: () {
-                  // Auto-scroll logic
                   if (index < videoState.videos.length - 1) {
                     _pageController?.nextPage(
                       duration: const Duration(milliseconds: 300),
