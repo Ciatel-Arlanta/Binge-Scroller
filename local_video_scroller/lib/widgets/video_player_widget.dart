@@ -50,9 +50,9 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
   }
 
   Future<void> _updatePlaybackState() async {
-    if (_controller != null && _isInitialized && !_isDisposed) {
+    if (_controller != null && _isInitialized && !_isDisposed && mounted) {
       try {
-        if (widget.autoPlay) {
+        if (widget.autoPlay && !_shouldPause) {
           await _controller!.play();
         } else {
           await _controller!.pause();
@@ -76,19 +76,21 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
       _controller!.addListener(() {
         if (_controller!.value.position >= _controller!.value.duration &&
             widget.onVideoEnd != null &&
+            widget.autoPlay &&
             !_isDisposed) {
           widget.onVideoEnd!();
         }
       });
 
-      if (widget.autoPlay) {
-        await _controller!.play();
-      }
-
       if (!_isDisposed) {
         setState(() {
           _isInitialized = true;
         });
+      }
+
+      // Re-check autoPlay after async init — user may have scrolled away
+      if (widget.autoPlay && !_shouldPause && !_isDisposed) {
+        await _controller!.play();
       }
     } catch (e) {
       print('Error initializing video: $e');

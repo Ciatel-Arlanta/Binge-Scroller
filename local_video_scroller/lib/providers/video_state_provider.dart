@@ -45,7 +45,7 @@ class VideoStateProvider extends ChangeNotifier {
   // Call this whenever the page changes
   Future<void> updateIndex(int index) async {
     _currentIndex = index;
-    // notifyListeners(); // Not strictly needed here if just scrolling, avoids rebuild loops
+    notifyListeners();
     
     if (_videos.isNotEmpty && index >= 0 && index < _videos.length) {
       final prefs = await SharedPreferences.getInstance();

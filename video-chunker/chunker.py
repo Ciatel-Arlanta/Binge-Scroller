@@ -6,11 +6,13 @@ from tqdm import tqdm
 import concurrent.futures
 import argparse
 import json
+import shutil
 
 class VideoChunker:
     def __init__(self, input_dir, output_dir="Processed_Output", target_duration=120, 
                  re_encode=False, strategy="silence", max_workers=4, 
-                 vertical_format="blur", output_resolution="1080x1920"):
+                 vertical_format="blur", output_resolution="1080x1920",
+                 hw_accel="auto"):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.target_duration = target_duration
@@ -23,8 +25,69 @@ class VideoChunker:
         self.max_workers = max_workers
         self.vertical_format = vertical_format  # "blur", "crop", "pad", or "none"
         self.output_resolution = output_resolution  # "1080x1920" (9:16) or "720x1280"
+        self.hw_accel = hw_accel  # "auto", "nvenc", "qsv", "amf", "none"
+        
+        # Resolved encoder settings (populated by _detect_hw_encoder)
+        self._hw_encoder = None
+        self._hw_decode_args = []
+        self._detect_hw_encoder()
         
         self.output_dir.mkdir(exist_ok=True)
+
+    def _detect_hw_encoder(self):
+        """Detect and select the best available hardware encoder"""
+        if self.hw_accel == "none":
+            self._hw_encoder = None
+            print("Hardware acceleration: DISABLED (software encoding)")
+            return
+
+        # Check available encoders
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            )
+            available = result.stdout
+        except Exception:
+            self._hw_encoder = None
+            print("Hardware acceleration: ffmpeg not found, using software")
+            return
+
+        # Priority order of encoders to try
+        if self.hw_accel == "auto":
+            candidates = [
+                ("h264_nvenc", "cuda", "NVIDIA NVENC"),
+                ("h264_qsv", "qsv", "Intel QuickSync"),
+                ("h264_amf", "amf", "AMD AMF"),
+            ]
+        elif self.hw_accel == "nvenc":
+            candidates = [("h264_nvenc", "cuda", "NVIDIA NVENC")]
+        elif self.hw_accel == "qsv":
+            candidates = [("h264_qsv", "qsv", "Intel QuickSync")]
+        elif self.hw_accel == "amf":
+            candidates = [("h264_amf", "amf", "AMD AMF")]
+        else:
+            candidates = []
+
+        for encoder, hwaccel, name in candidates:
+            if encoder in available:
+                # Verify it actually works with a quick test
+                test_cmd = [
+                    "ffmpeg", "-hide_banner", "-y",
+                    "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+                    "-c:v", encoder, "-f", "null", "-"
+                ]
+                test = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if test.returncode == 0:
+                    self._hw_encoder = encoder
+                    self._hw_decode_args = ["-hwaccel", hwaccel]
+                    if hwaccel == "cuda":
+                        self._hw_decode_args.extend(["-hwaccel_output_format", "nv12"])
+                    print(f"Hardware acceleration: {name} ({encoder})")
+                    return
+
+        self._hw_encoder = None
+        print("Hardware acceleration: No working GPU encoder found, using software (libx264)")
         
     def extract_show_info(self, filename):
         """Extract show name, season, and episode from filename"""
@@ -170,6 +233,60 @@ class VideoChunker:
                     continue
         
         return silence_periods
+
+    def detect_silence_windowed(self, video_path, total_duration):
+        """Silence detection that only analyzes audio around expected cut points.
+        
+        Instead of decoding the entire 1hr audio stream, we only sample ~40s windows
+        around each expected cut point. For a 1hr file with 120s chunks, this analyzes
+        ~30 * 40s = 20 minutes of audio instead of 60 minutes — roughly 3x faster.
+        """
+        print(f"Analyzing silence (windowed) in {video_path.name}...")
+        
+        silence_periods = []
+        # Calculate expected cut positions and only analyze those windows
+        expected_cuts = []
+        t = self.target_duration
+        while t < total_duration:
+            expected_cuts.append(t)
+            t += self.target_duration
+
+        for cut_time in tqdm(expected_cuts, desc="Scanning windows", unit="window"):
+            window_start = max(0, cut_time - 20)
+            window_end = min(total_duration, cut_time + 20)
+            
+            cmd = [
+                "ffmpeg",
+                "-ss", str(window_start),
+                "-t", str(window_end - window_start),
+                "-i", str(video_path),
+                "-vn",
+                "-af", f"aresample=8000,silencedetect=noise={self.silence_threshold}:d={self.min_silence_duration}",
+                "-f", "null", "-"
+            ]
+            
+            result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True,
+                                  stdout=subprocess.DEVNULL)
+            current_start = None
+            
+            for line in result.stderr.split('\n'):
+                if "silence_start" in line:
+                    try:
+                        # Timestamps are relative to the window, offset to absolute
+                        current_start = float(line.split("silence_start:")[1].split()[0]) + window_start
+                    except:
+                        continue
+                elif "silence_end" in line and current_start is not None:
+                    try:
+                        end = float(line.split("silence_end:")[1].split()[0]) + window_start
+                        dur = float(line.split("silence_duration:")[1].split()[0])
+                        if dur >= self.min_silence_duration:
+                            silence_periods.append((current_start, end, dur))
+                        current_start = None
+                    except:
+                        continue
+        
+        return silence_periods
     
     def find_cut_points_fixed(self, duration):
         """Simple fixed-interval cutting (FASTEST)"""
@@ -180,9 +297,10 @@ class VideoChunker:
             current += self.target_duration
         return cut_points
     
-    def find_cut_points_silence(self, video_path, duration):
+    def find_cut_points_silence(self, video_path, duration, silence_periods=None):
         """Find cut points based on silence detection"""
-        silence_periods = self.detect_silence_fast(video_path)
+        if silence_periods is None:
+            silence_periods = self.detect_silence_windowed(video_path, duration)
         
         cut_points = [0]
         current_time = 0
@@ -210,9 +328,10 @@ class VideoChunker:
         
         return cut_points
     
-    def find_cut_points_scene(self, video_path, duration):
+    def find_cut_points_scene(self, video_path, duration, scene_times=None):
         """Find cut points based on scene changes"""
-        scene_times = self.detect_scene_changes(video_path)
+        if scene_times is None:
+            scene_times = self.detect_scene_changes(video_path)
         
         if not scene_times:
             print("No scenes detected, falling back to fixed intervals")
@@ -250,21 +369,25 @@ class VideoChunker:
         return cut_points
     
     def find_cut_points_smart(self, video_path, duration):
-        """Hybrid approach: Try scene detection first, fall back to silence, then fixed"""
+        """Hybrid approach: Try scene detection first, fall back to silence, then fixed.
+        
+        Optimized to avoid double-scanning: reuses analysis results from scene detection
+        pass instead of re-running silence detection from scratch.
+        """
         print(f"Using smart detection for {video_path.name}...")
         
         scene_times = self.detect_scene_changes(video_path, threshold=0.3)
         
         if len(scene_times) >= 3:
             print(f"Found {len(scene_times)} scene changes, using scene-based cuts")
-            return self.find_cut_points_scene(video_path, duration)
+            return self.find_cut_points_scene(video_path, duration, scene_times=scene_times)
         
-        print("Not enough scenes, trying silence detection...")
-        silence_periods = self.detect_silence_fast(video_path)
+        print("Not enough scenes, trying windowed silence detection...")
+        silence_periods = self.detect_silence_windowed(video_path, duration)
         
         if len(silence_periods) >= 2:
             print(f"Found {len(silence_periods)} silence periods")
-            return self.find_cut_points_silence(video_path, duration)
+            return self.find_cut_points_silence(video_path, duration, silence_periods=silence_periods)
         
         print("Using fixed intervals as fallback")
         return self.find_cut_points_fixed(duration)
@@ -284,15 +407,20 @@ class VideoChunker:
     
     def create_chunk(self, video_path, start, end, output_path, input_width, input_height):
         """Creates a single chunk with optional vertical format conversion"""
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-i", str(video_path),
-            "-t", str(end - start),
-        ]
+        cmd = ["ffmpeg", "-y"]
         
         # Determine if we need to re-encode
         needs_reencode = self.re_encode or self.vertical_format != "none"
+        
+        if needs_reencode and self._hw_decode_args:
+            # Add hardware-accelerated decoding for faster input processing
+            cmd.extend(self._hw_decode_args)
+        
+        cmd.extend([
+            "-ss", str(start),
+            "-i", str(video_path),
+            "-t", str(end - start),
+        ])
         
         if needs_reencode:
             # Get vertical format filter if needed
@@ -301,18 +429,61 @@ class VideoChunker:
             if video_filter:
                 cmd.extend(["-filter_complex", video_filter])
             
-            # Video encoding settings optimized for mobile
+            # Select encoder: GPU or software
+            encoder = self._hw_encoder or "libx264"
+            cmd.extend(["-c:v", encoder])
+            
+            if self._hw_encoder and "nvenc" in self._hw_encoder:
+                # NVENC-specific settings — optimized for speed + quality
+                cmd.extend([
+                    "-profile:v", "high",
+                    "-level", "4.2",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "p4",       # NVENC preset: p1(fastest) to p7(best quality), p4 is balanced
+                    "-tune", "hq",
+                    "-rc", "vbr",
+                    "-cq", "23",           # Quality level (like CRF)
+                    "-maxrate", "2M",
+                    "-bufsize", "4M",
+                    "-movflags", "+faststart",
+                ])
+            elif self._hw_encoder and "qsv" in self._hw_encoder:
+                # Intel QuickSync settings
+                cmd.extend([
+                    "-profile:v", "high",
+                    "-pix_fmt", "nv12",
+                    "-preset", "faster",
+                    "-global_quality", "23",
+                    "-maxrate", "2M",
+                    "-bufsize", "4M",
+                    "-movflags", "+faststart",
+                ])
+            elif self._hw_encoder and "amf" in self._hw_encoder:
+                # AMD AMF settings
+                cmd.extend([
+                    "-pix_fmt", "nv12",
+                    "-quality", "balanced",
+                    "-rc", "vbr_latency",
+                    "-qp_i", "23", "-qp_p", "23",
+                    "-maxrate", "2M",
+                    "-bufsize", "4M",
+                    "-movflags", "+faststart",
+                ])
+            else:
+                # Software (libx264) fallback
+                cmd.extend([
+                    "-profile:v", "high",
+                    "-level", "4.2",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "veryfast",   # Faster than "faster" with minimal quality loss
+                    "-crf", "23",
+                    "-maxrate", "2M",
+                    "-bufsize", "4M",
+                    "-movflags", "+faststart",
+                ])
+            
+            # Audio settings
             cmd.extend([
-                "-c:v", "libx264",
-                "-profile:v", "high",
-                "-level", "4.2",
-                "-pix_fmt", "yuv420p",
-                "-preset", "faster",
-                "-crf", "23",
-                "-maxrate", "2M",  # Limit bitrate for mobile streaming
-                "-bufsize", "4M",
-                "-movflags", "+faststart",
-                # Audio settings
                 "-c:a", "aac",
                 "-ac", "2",
                 "-ar", "44100",
@@ -338,6 +509,7 @@ class VideoChunker:
         print(f"Strategy: {self.strategy}")
         print(f"Vertical format: {self.vertical_format}")
         print(f"Output resolution: {self.output_resolution}")
+        print(f"Encoder: {self._hw_encoder or 'libx264 (software)'}")
         print(f"{'='*60}")
         
         # Get video info
@@ -349,9 +521,18 @@ class VideoChunker:
         
         print(f"Found {len(cut_points)-1} chunks to create")
         
+        # Determine optimal worker count
+        # For GPU encoding, fewer parallel jobs is usually better (GPU has limited encoder sessions)
+        effective_workers = self.max_workers
+        if self._hw_encoder:
+            # NVENC typically supports 3-5 concurrent sessions (consumer GPUs)
+            # More than that will queue or error
+            effective_workers = min(self.max_workers, 3)
+            print(f"GPU encoding: limiting to {effective_workers} parallel workers")
+        
         # Create chunks in parallel
         futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             for i in range(len(cut_points) - 1):
                 start = cut_points[i]
                 end = cut_points[i + 1]
@@ -395,6 +576,7 @@ class VideoChunker:
         print(f"Output resolution: {self.output_resolution}")
         print(f"Strategy: {self.strategy}")
         print(f"Max workers: {self.max_workers}")
+        print(f"Encoder: {self._hw_encoder or 'libx264 (software)'}")
         
         for video_file in video_files:
             self.process_single_video(video_file)
@@ -420,10 +602,17 @@ Output Resolutions:
   720x1280  - HD vertical (9:16) - faster processing, smaller files
 
 Chunking Strategies:
-  smart   - Adaptive (tries scene → silence → fixed)
+  smart   - Adaptive (tries scene -> silence -> fixed)
   scene   - Cuts at scene changes
   silence - Cuts during silence
   fixed   - Simple time-based cuts (fastest)
+
+Hardware Acceleration:
+  auto    - Auto-detect best GPU encoder (default)
+  nvenc   - Force NVIDIA NVENC
+  qsv     - Force Intel QuickSync
+  amf     - Force AMD AMF
+  none    - Disable GPU, use software (libx264)
 
 RECOMMENDED FOR REELS APP:
   python chunker.py /input_videos -d 90 --vertical blur --resolution 1080x1920 --strategy smart
@@ -432,7 +621,7 @@ FASTEST PROCESSING (testing):
   python chunker.py /videos -d 60 --vertical blur --resolution 720x1280 --strategy fixed -w 8
 
 Examples:
-  # Full quality reels with blur background
+  # Full quality reels with blur background (GPU accelerated)
   python chunker.py /videos -d 75 --vertical blur --strategy smart
   
   # Fast testing with lower resolution
@@ -440,6 +629,9 @@ Examples:
   
   # Center crop (loses content on sides)
   python chunker.py /videos -d 60 --vertical crop --strategy scene
+  
+  # Force software encoding
+  python chunker.py /videos -d 60 --vertical blur --hw-accel none
         """
     )
     
@@ -461,6 +653,9 @@ Examples:
                        help="Chunking strategy (default: smart)")
     parser.add_argument("-w", "--workers", type=int, default=4,
                        help="Max parallel chunk workers (default: 4)")
+    parser.add_argument("--hw-accel", choices=["auto", "nvenc", "qsv", "amf", "none"],
+                       default="auto",
+                       help="Hardware acceleration method (default: auto)")
     
     args = parser.parse_args()
     
@@ -472,6 +667,7 @@ Examples:
         args.strategy,
         args.workers,
         args.vertical,
-        args.resolution
+        args.resolution,
+        args.hw_accel
     )
     chunker.process_videos()
