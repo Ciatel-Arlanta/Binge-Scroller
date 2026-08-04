@@ -36,24 +36,23 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> with WidgetsBindingOb
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    final videoState = Provider.of<VideoStateProvider>(context, listen: false);
-    
+
     switch (state) {
       case AppLifecycleState.paused:
-        _isAppInBackground = true;
-        // Pause all videos when app goes to background
-        // This will be handled by the VideoPlayerWidget's didUpdateWidget method
-        // We temporarily set a flag to indicate app is in background
-        break;
-      case AppLifecycleState.resumed:
-        _isAppInBackground = false;
-        // Resume current video when app comes to foreground
-        // Trigger a rebuild to update the video player widget
-        setState(() {});
-        break;
-      case AppLifecycleState.detached:
       case AppLifecycleState.inactive:
       case AppLifecycleState.hidden:
+        // Rebuild so itemBuilder passes autoPlay=false and players pause.
+        // inactive/hidden cover screen lock before paused fires.
+        setState(() {
+          _isAppInBackground = true;
+        });
+        break;
+      case AppLifecycleState.resumed:
+        setState(() {
+          _isAppInBackground = false;
+        });
+        break;
+      case AppLifecycleState.detached:
         break;
     }
   }

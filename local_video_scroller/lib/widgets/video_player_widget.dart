@@ -26,6 +26,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
   bool _showSeekIndicator = false;
   String _seekDirection = '';
   bool _shouldPause = false; // Track if video should be paused
+  bool _hasEnded = false; // Latch so onVideoEnd fires once per playthrough
 
   @override
   void initState() {
@@ -63,8 +64,22 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
     }
   }
 
+  void _onControllerUpdate() {
+    if (_isDisposed || _controller == null) return;
+    final value = _controller!.value;
+    if (!_hasEnded &&
+        value.duration > Duration.zero &&
+        value.position >= value.duration &&
+        widget.onVideoEnd != null &&
+        widget.autoPlay) {
+      _hasEnded = true;
+      widget.onVideoEnd!();
+    }
+  }
+
   Future<void> _initializeVideo() async {
     try {
+      _hasEnded = false;
       _controller = VideoPlayerController.file(
         File(widget.video.path),
         videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
@@ -73,14 +88,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
       await _controller!.initialize();
       await _controller!.setVolume(1.0);
 
-      _controller!.addListener(() {
-        if (_controller!.value.position >= _controller!.value.duration &&
-            widget.onVideoEnd != null &&
-            widget.autoPlay &&
-            !_isDisposed) {
-          widget.onVideoEnd!();
-        }
-      });
+      _controller!.addListener(_onControllerUpdate);
 
       if (!_isDisposed) {
         setState(() {
@@ -128,6 +136,13 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
           _shouldPause = true;
           _controller!.pause();
         } else {
+          // Replay from start if already at end
+          final value = _controller!.value;
+          if (value.duration > Duration.zero &&
+              value.position >= value.duration) {
+            _hasEnded = false;
+            _controller!.seekTo(Duration.zero);
+          }
           _shouldPause = false;
           _controller!.play();
         }
@@ -140,40 +155,40 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
       final currentPosition = _controller!.value.position;
       final duration = _controller!.value.duration;
 
-      if (currentPosition != null && duration != null) {
-        final seekAmount = const Duration(seconds: 5);
-        Duration newPosition;
+      final seekAmount = const Duration(seconds: 5);
+      Duration newPosition;
 
-        if (forward) {
-          newPosition = currentPosition + seekAmount;
-          if (newPosition > duration) {
-            newPosition = duration;
-          }
-          _seekDirection = '+5s';
-        } else {
-          newPosition = currentPosition - seekAmount;
-          if (newPosition < Duration.zero) {
-            newPosition = Duration.zero;
-          }
-          _seekDirection = '-5s';
+      if (forward) {
+        newPosition = currentPosition + seekAmount;
+        if (newPosition > duration) {
+          newPosition = duration;
         }
-
-        _controller!.seekTo(newPosition);
-
-        // Show seek indicator
-        setState(() {
-          _showSeekIndicator = true;
-        });
-
-        // Hide seek indicator after 1 second
-        Future.delayed(const Duration(seconds: 1), () {
-          if (mounted) {
-            setState(() {
-              _showSeekIndicator = false;
-            });
-          }
-        });
+        _seekDirection = '+5s';
+      } else {
+        newPosition = currentPosition - seekAmount;
+        if (newPosition < Duration.zero) {
+          newPosition = Duration.zero;
+        }
+        _seekDirection = '-5s';
+        // Seeking backwards allows completion to fire again
+        _hasEnded = false;
       }
+
+      _controller!.seekTo(newPosition);
+
+      // Show seek indicator
+      setState(() {
+        _showSeekIndicator = true;
+      });
+
+      // Hide seek indicator after 1 second
+      Future.delayed(const Duration(seconds: 1), () {
+        if (mounted) {
+          setState(() {
+            _showSeekIndicator = false;
+          });
+        }
+      });
     }
   }
 
