@@ -395,15 +395,25 @@ class VideoChunker:
     def find_cut_points(self, video_path):
         """Main entry point for finding cut points"""
         duration, _, _ = self.get_video_info(video_path)
-        
+
         if self.strategy == "fixed":
-            return self.find_cut_points_fixed(duration)
+            cut_points = self.find_cut_points_fixed(duration)
         elif self.strategy == "scene":
-            return self.find_cut_points_scene(video_path, duration)
+            cut_points = self.find_cut_points_scene(video_path, duration)
         elif self.strategy == "smart":
-            return self.find_cut_points_smart(video_path, duration)
+            cut_points = self.find_cut_points_smart(video_path, duration)
         else:
-            return self.find_cut_points_silence(video_path, duration)
+            cut_points = self.find_cut_points_silence(video_path, duration)
+
+        # Ensure the tail of the video is included as the final chunk.
+        MIN_TAIL = 3.0
+        if not cut_points:
+            cut_points = [0]
+        if duration - cut_points[-1] >= MIN_TAIL:
+            cut_points.append(duration)
+        elif len(cut_points) >= 2:
+            cut_points[-1] = duration  # absorb a tiny tail into the last chunk
+        return cut_points
     
     def create_chunk(self, video_path, start, end, output_path, input_width, input_height):
         """Creates a single chunk with optional vertical format conversion"""
