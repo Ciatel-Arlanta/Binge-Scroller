@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import types
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -151,3 +153,96 @@ class TestGetVerticalFilterSubtitles:
         assert filt is not None
         assert "subtitles=" not in filt
         assert "v_with_subs" not in filt
+
+
+class TestCreateChunkRobustness:
+    """create_chunk: copy mapping, resume skip, ffmpeg error surfacing."""
+
+    @pytest.fixture
+    def copy_chunker(self, tmp_path):
+        return VideoChunker(
+            tmp_path,
+            output_dir=tmp_path / "out",
+            hw_accel="none",
+            target_duration=120,
+            vertical_format="none",
+            re_encode=False,
+            burn_subtitles=False,
+        )
+
+    def test_copy_path_maps_video_and_audio(self, copy_chunker, tmp_path, monkeypatch):
+        recorded = {}
+
+        def fake_run(cmd, **kwargs):
+            recorded["cmd"] = list(cmd)
+            # Mimic ffmpeg writing the output path (last arg)
+            Path(cmd[-1]).write_bytes(b"ok")
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr("chunker.subprocess.run", fake_run)
+        out = tmp_path / "out" / "chunk.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        name = copy_chunker.create_chunk(
+            video_path=tmp_path / "in.mkv",
+            start=0,
+            end=10,
+            output_path=out,
+            input_width=1920,
+            input_height=1080,
+            sub_info=None,
+        )
+        cmd = recorded["cmd"]
+        # map flags present as consecutive pairs
+        assert "-map" in cmd
+        map_args = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-map"]
+        assert "0:v:0" in map_args
+        assert "0:a:0?" in map_args
+        assert "-c" in cmd and "copy" in cmd
+        assert name == "chunk.mp4"
+        assert out.exists()  # renamed from tmp
+
+    def test_resume_skips_existing(self, copy_chunker, tmp_path, monkeypatch):
+        called = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            called["n"] += 1
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr("chunker.subprocess.run", fake_run)
+        out = tmp_path / "out" / "existing.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"already-rendered-content")
+        name = copy_chunker.create_chunk(
+            video_path=tmp_path / "in.mkv",
+            start=0,
+            end=10,
+            output_path=out,
+            input_width=1920,
+            input_height=1080,
+            sub_info=None,
+        )
+        assert name == "existing.mp4"
+        assert called["n"] == 0
+
+    def test_ffmpeg_failure_surfaces_stderr(self, copy_chunker, tmp_path, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1, stderr="line1\nBAD THING\nline3"
+            )
+
+        monkeypatch.setattr("chunker.subprocess.run", fake_run)
+        out = tmp_path / "out" / "fail.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(RuntimeError) as ei:
+            copy_chunker.create_chunk(
+                video_path=tmp_path / "in.mkv",
+                start=0,
+                end=10,
+                output_path=out,
+                input_width=1920,
+                input_height=1080,
+                sub_info=None,
+            )
+        assert "BAD THING" in str(ei.value)
+        assert not out.exists()
+        assert not out.with_suffix(".tmp.mp4").exists()

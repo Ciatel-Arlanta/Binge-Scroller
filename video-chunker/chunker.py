@@ -208,12 +208,16 @@ class VideoChunker:
             str(video_path)
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-        info = json.loads(result.stdout)
-        
-        width = info['streams'][0]['width']
-        height = info['streams'][0]['height']
-        duration = float(info['format']['duration'])
-        
+        try:
+            info = json.loads(result.stdout)
+            width = info['streams'][0]['width']
+            height = info['streams'][0]['height']
+            duration = float(info['format']['duration'])
+        except (KeyError, IndexError, ValueError, json.JSONDecodeError, TypeError) as e:
+            raise RuntimeError(
+                f"Could not read video info from {Path(video_path).name}"
+            ) from e
+
         return duration, width, height
     
     def get_vertical_filter(self, input_width, input_height, sub_info=None, video_path=None):
@@ -336,7 +340,7 @@ class VideoChunker:
                 try:
                     time = float(line.split("pts_time:")[1].split()[0])
                     scene_times.append(time)
-                except:
+                except (ValueError, IndexError):
                     continue
         
         return sorted(scene_times)
@@ -361,7 +365,7 @@ class VideoChunker:
             if "silence_start" in line:
                 try:
                     current_start = float(line.split("silence_start:")[1].split()[0])
-                except:
+                except (ValueError, IndexError):
                     continue
             elif "silence_end" in line and current_start is not None:
                 try:
@@ -370,7 +374,7 @@ class VideoChunker:
                     if duration >= self.min_silence_duration:
                         silence_periods.append((current_start, end, duration))
                     current_start = None
-                except:
+                except (ValueError, IndexError):
                     continue
         
         return silence_periods
@@ -415,7 +419,7 @@ class VideoChunker:
                     try:
                         # Timestamps are relative to the window, offset to absolute
                         current_start = float(line.split("silence_start:")[1].split()[0]) + window_start
-                    except:
+                    except (ValueError, IndexError):
                         continue
                 elif "silence_end" in line and current_start is not None:
                     try:
@@ -424,7 +428,7 @@ class VideoChunker:
                         if dur >= self.min_silence_duration:
                             silence_periods.append((current_start, end, dur))
                         current_start = None
-                    except:
+                    except (ValueError, IndexError):
                         continue
         
         return silence_periods
@@ -558,6 +562,12 @@ class VideoChunker:
     
     def create_chunk(self, video_path, start, end, output_path, input_width, input_height, sub_info=None):
         """Creates a single chunk with optional vertical format conversion and subtitle burn-in"""
+        output_path = Path(output_path)
+        # Resume: skip non-empty existing outputs
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path.name
+
+        tmp_path = output_path.with_suffix(".tmp.mp4")
         cmd = ["ffmpeg", "-y"]
         
         # Determine if we need to re-encode
@@ -656,16 +666,32 @@ class VideoChunker:
                 "-b:a", "128k"
             ])
         else:
-            # Fast stream copy
+            # Fast stream copy — map only primary video + first audio (optional)
             cmd.extend([
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
                 "-c", "copy",
                 "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart"
             ])
         
-        cmd.append(str(output_path))
-        
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd.append(str(tmp_path))
+
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode != 0:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            tail = "\n".join(result.stderr.strip().splitlines()[-8:])
+            raise RuntimeError(
+                f"ffmpeg failed for {output_path.name} (exit {result.returncode}):\n{tail}"
+            )
+
+        os.replace(tmp_path, output_path)
         return output_path.name
 
     def process_single_video(self, video_file):
@@ -758,13 +784,20 @@ class VideoChunker:
         print(f"Encoder: {self._hw_encoder or 'libx264 (software)'}")
         print(f"Burn subtitles: {self.burn_subtitles} (lang={self.sub_lang})")
         
+        failed = 0
         for video_file in video_files:
-            self.process_single_video(video_file)
-        
-        print(f"\n{'='*60}")
-        print("All videos processed successfully!")
-        print(f"{'='*60}")
+            try:
+                self.process_single_video(video_file)
+            except Exception as e:
+                failed += 1
+                print(f"\nError processing {video_file.name}: {e}")
 
+        print(f"\n{'='*60}")
+        if failed:
+            print(f"Finished with {failed} failed file(s) out of {len(video_files)}.")
+        else:
+            print("All videos processed successfully!")
+        print(f"{'='*60}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
