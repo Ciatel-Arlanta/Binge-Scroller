@@ -1,3 +1,10 @@
 venv/
 input_videos/
 Processed_Output/
+
+# Local agent/tooling workspaces — not part of the project
+# plans/ tracked (implementation + design docs)
+.agents/
+.claude/
+.tokensave/
+skills-lock.json
