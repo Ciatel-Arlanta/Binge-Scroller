@@ -50,33 +50,21 @@ class TestFindCutPointsFixed:
 class TestFindCutPoints:
     """Dispatcher (find_cut_points) appends/absorbs the video end."""
 
-    def test_final_chunk_boundary_included(self, chunker, monkeypatch):
-        monkeypatch.setattr(
-            chunker, "get_video_info", lambda p: (300, 1920, 1080)
-        )
+    def test_final_chunk_boundary_included(self, chunker):
         chunker.strategy = "fixed"
-        cuts = chunker.find_cut_points("dummy.mp4")
+        cuts = chunker.find_cut_points("dummy.mp4", 300)
         assert cuts == [0, 120, 240, 300]
 
-    def test_exact_duration_no_zero_length_tail(self, chunker, monkeypatch):
-        monkeypatch.setattr(
-            chunker, "get_video_info", lambda p: (240, 1920, 1080)
-        )
+    def test_exact_duration_no_zero_length_tail(self, chunker):
         chunker.strategy = "fixed"
-        cuts = chunker.find_cut_points("dummy.mp4")
+        cuts = chunker.find_cut_points("dummy.mp4", 240)
         assert cuts == [0, 120, 240]
-        # No degenerate final segment
         for i in range(len(cuts) - 1):
             assert cuts[i + 1] - cuts[i] > 0
 
-    def test_tiny_tail_absorbed(self, chunker, monkeypatch):
-        # 241s with 120s target: fixed yields [0, 120, 240]; 1s tail < MIN_TAIL
-        # is absorbed into the last cut → [0, 120, 241]
-        monkeypatch.setattr(
-            chunker, "get_video_info", lambda p: (241, 1920, 1080)
-        )
+    def test_tiny_tail_absorbed(self, chunker):
         chunker.strategy = "fixed"
-        cuts = chunker.find_cut_points("dummy.mp4")
+        cuts = chunker.find_cut_points("dummy.mp4", 241)
         assert cuts == [0, 120, 241]
 
 
@@ -246,3 +234,29 @@ class TestCreateChunkRobustness:
         assert "BAD THING" in str(ei.value)
         assert not out.exists()
         assert not out.with_suffix(".tmp.mp4").exists()
+
+
+class TestDetectSilenceWindowed:
+    def test_parallel_windows_offset_and_sorted(self, chunker, monkeypatch):
+        """Each window's relative silence times are offset by window_start and sorted."""
+        canned = (
+            "[silencedetect @ x] silence_start: 5.0\n"
+            "[silencedetect @ x] silence_end: 6.0 | silence_duration: 1.0\n"
+        )
+        # Build with real newlines
+        canned = (
+            "[silencedetect @ x] silence_start: 5.0"
+            + chr(10)
+            + "[silencedetect @ x] silence_end: 6.0 | silence_duration: 1.0"
+            + chr(10)
+        )
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=0, stderr=canned)
+
+        monkeypatch.setattr("chunker.subprocess.run", fake_run)
+        periods = chunker.detect_silence_windowed(Path("dummy.mp4"), 300)
+        starts = [p[0] for p in periods]
+        assert starts == sorted(starts)
+        assert (105.0, 106.0, 1.0) in periods
+        assert (225.0, 226.0, 1.0) in periods

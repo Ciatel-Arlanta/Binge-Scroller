@@ -327,7 +327,8 @@ class VideoChunker:
         
         cmd = [
             "ffmpeg", "-i", str(video_path),
-            "-filter:v", f"select='gt(scene,{threshold})',showinfo",
+            "-an", "-sn",
+            "-filter:v", f"scale=320:-2,select='gt(scene,{threshold})',showinfo",
             "-f", "null", "-"
         ]
         
@@ -335,7 +336,7 @@ class VideoChunker:
                               stdout=subprocess.DEVNULL)
         
         scene_times = []
-        for line in result.stderr.split('\n'):
+        for line in result.stderr.splitlines():
             if "pts_time:" in line:
                 try:
                     time = float(line.split("pts_time:")[1].split()[0])
@@ -361,7 +362,7 @@ class VideoChunker:
         silence_periods = []
         current_start = None
         
-        for line in result.stderr.split('\n'):
+        for line in result.stderr.splitlines():
             if "silence_start" in line:
                 try:
                     current_start = float(line.split("silence_start:")[1].split()[0])
@@ -385,10 +386,10 @@ class VideoChunker:
         Instead of decoding the entire 1hr audio stream, we only sample ~40s windows
         around each expected cut point. For a 1hr file with 120s chunks, this analyzes
         ~30 * 40s = 20 minutes of audio instead of 60 minutes — roughly 3x faster.
+        Windows are scanned in parallel.
         """
         print(f"Analyzing silence (windowed) in {video_path.name}...")
         
-        silence_periods = []
         # Calculate expected cut positions and only analyze those windows
         expected_cuts = []
         t = self.target_duration
@@ -396,10 +397,11 @@ class VideoChunker:
             expected_cuts.append(t)
             t += self.target_duration
 
-        for cut_time in tqdm(expected_cuts, desc="Scanning windows", unit="window"):
+        def _scan_window(cut_time):
             window_start = max(0, cut_time - 20)
             window_end = min(total_duration, cut_time + 20)
-            
+            periods = []
+
             cmd = [
                 "ffmpeg",
                 "-ss", str(window_start),
@@ -409,30 +411,54 @@ class VideoChunker:
                 "-af", f"aresample=8000,silencedetect=noise={self.silence_threshold}:d={self.min_silence_duration}",
                 "-f", "null", "-"
             ]
-            
-            result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True,
-                                  stdout=subprocess.DEVNULL)
+
+            result = subprocess.run(
+                cmd, stderr=subprocess.PIPE, text=True, stdout=subprocess.DEVNULL
+            )
             current_start = None
-            
-            for line in result.stderr.split('\n'):
+
+            for line in result.stderr.splitlines():
                 if "silence_start" in line:
                     try:
                         # Timestamps are relative to the window, offset to absolute
-                        current_start = float(line.split("silence_start:")[1].split()[0]) + window_start
+                        current_start = (
+                            float(line.split("silence_start:")[1].split()[0])
+                            + window_start
+                        )
                     except (ValueError, IndexError):
                         continue
                 elif "silence_end" in line and current_start is not None:
                     try:
-                        end = float(line.split("silence_end:")[1].split()[0]) + window_start
+                        end = (
+                            float(line.split("silence_end:")[1].split()[0])
+                            + window_start
+                        )
                         dur = float(line.split("silence_duration:")[1].split()[0])
                         if dur >= self.min_silence_duration:
-                            silence_periods.append((current_start, end, dur))
+                            periods.append((current_start, end, dur))
                         current_start = None
                     except (ValueError, IndexError):
                         continue
-        
+            return periods
+
+        silence_periods = []
+        workers = min(self.max_workers, 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_scan_window, cut_time): cut_time
+                for cut_time in expected_cuts
+            }
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Scanning windows",
+                unit="window",
+            ):
+                silence_periods.extend(future.result())
+
+        silence_periods.sort(key=lambda p: p[0])
         return silence_periods
-    
+
     def find_cut_points_fixed(self, duration):
         """Simple fixed-interval cutting (FASTEST)"""
         cut_points = []
@@ -537,10 +563,8 @@ class VideoChunker:
         print("Using fixed intervals as fallback")
         return self.find_cut_points_fixed(duration)
     
-    def find_cut_points(self, video_path):
-        """Main entry point for finding cut points"""
-        duration, _, _ = self.get_video_info(video_path)
-
+    def find_cut_points(self, video_path, duration):
+        """Main entry point for finding cut points (duration from caller probe)."""
         if self.strategy == "fixed":
             cut_points = self.find_cut_points_fixed(duration)
         elif self.strategy == "scene":
@@ -704,8 +728,8 @@ class VideoChunker:
         print(f"Encoder: {self._hw_encoder or 'libx264 (software)'}")
         print(f"{'='*60}")
         
-        # Get video info
-        _, input_width, input_height = self.get_video_info(video_file)
+        # Get video info once per file (shared by cut-point analysis + encode)
+        duration, input_width, input_height = self.get_video_info(video_file)
         print(f"Input resolution: {input_width}x{input_height}")
         
         # Detect subtitle stream
@@ -716,7 +740,7 @@ class VideoChunker:
             print("Subtitles: None found or disabled")
         
         show_name, season, episode = self.extract_show_info(video_file.name)
-        cut_points = self.find_cut_points(video_file)
+        cut_points = self.find_cut_points(video_file, duration)
         
         print(f"Found {len(cut_points)-1} chunks to create")
         
