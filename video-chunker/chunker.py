@@ -8,11 +8,19 @@ import argparse
 import json
 import shutil
 
+
+def _escape_subtitle_path(path):
+    """Escape a filesystem path for use inside an ffmpeg subtitles filter."""
+    p = str(path).replace("\\", "/")
+    p = p.replace(":", "\\:").replace("'", "\\'")
+    return p
+
 class VideoChunker:
     def __init__(self, input_dir, output_dir="Processed_Output", target_duration=120, 
                  re_encode=False, strategy="silence", max_workers=4, 
                  vertical_format="blur", output_resolution="1080x1920",
-                 hw_accel="auto"):
+                 hw_accel="auto", burn_subtitles=True, sub_lang="eng",
+                 sub_index=None):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.target_duration = target_duration
@@ -26,6 +34,9 @@ class VideoChunker:
         self.vertical_format = vertical_format  # "blur", "crop", "pad", or "none"
         self.output_resolution = output_resolution  # "1080x1920" (9:16) or "720x1280"
         self.hw_accel = hw_accel  # "auto", "nvenc", "qsv", "amf", "none"
+        self.burn_subtitles = burn_subtitles  # True to burn in embedded subtitles
+        self.sub_lang = sub_lang  # Preferred subtitle language tag (e.g. "eng")
+        self.sub_index = sub_index  # Manual override for subtitle stream index (among subtitle streams)
         
         # Resolved encoder settings (populated by _detect_hw_encoder)
         self._hw_encoder = None
@@ -108,6 +119,85 @@ class VideoChunker:
         show_name = Path(filename).stem
         return show_name, "01", "01"
     
+    def detect_subtitle_stream(self, video_path):
+        """Detect the best subtitle stream to burn in.
+        
+        Returns a dict with subtitle info, or None if no suitable subtitle found.
+        Result: {"sub_index": int, "codec": str, "lang": str, "title": str}
+        where sub_index is the index among subtitle streams (for use as 0:s:N).
+        """
+        if not self.burn_subtitles:
+            return None
+        
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title",
+            "-of", "json",
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            info = json.loads(result.stdout)
+        except (json.JSONDecodeError, KeyError):
+            return None
+        
+        streams = info.get("streams", [])
+        sub_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+        
+        if not sub_streams:
+            return None
+        
+        # If manual sub_index override is specified, use it directly
+        if self.sub_index is not None:
+            if self.sub_index < len(sub_streams):
+                s = sub_streams[self.sub_index]
+                tags = s.get("tags", {})
+                return {
+                    "sub_index": self.sub_index,
+                    "codec": s.get("codec_name", "unknown"),
+                    "lang": tags.get("language", "und"),
+                    "title": tags.get("title", "Untitled"),
+                }
+            else:
+                print(f"Warning: --sub-index {self.sub_index} out of range (found {len(sub_streams)} subtitle streams)")
+                return None
+        
+        # Auto-detect: find the best subtitle track for the preferred language
+        # Prefer "Full" tracks over "Signs/Songs" tracks
+        candidates = []
+        for i, s in enumerate(sub_streams):
+            tags = s.get("tags", {})
+            lang = tags.get("language", "und")
+            title = tags.get("title", "").lower()
+            codec = s.get("codec_name", "unknown")
+            
+            if lang == self.sub_lang:
+                # Score: full subtitle tracks rank higher than signs/songs
+                is_signs = any(kw in title for kw in ["sign", "song", "forced"])
+                score = 0 if is_signs else 1
+                candidates.append((score, i, codec, lang, tags.get("title", "Untitled")))
+        
+        if not candidates:
+            # Fallback: try the first subtitle stream regardless of language
+            s = sub_streams[0]
+            tags = s.get("tags", {})
+            return {
+                "sub_index": 0,
+                "codec": s.get("codec_name", "unknown"),
+                "lang": tags.get("language", "und"),
+                "title": tags.get("title", "Untitled"),
+            }
+        
+        # Pick the best candidate (highest score, then earliest index)
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        best = candidates[0]
+        return {
+            "sub_index": best[1],
+            "codec": best[2],
+            "lang": best[3],
+            "title": best[4],
+        }
+
     def get_video_info(self, video_path):
         """Get video duration and dimensions"""
         cmd = [
@@ -126,19 +216,50 @@ class VideoChunker:
         
         return duration, width, height
     
-    def get_vertical_filter(self, input_width, input_height):
-        """Generate FFmpeg filter for converting to vertical format"""
+    def get_vertical_filter(self, input_width, input_height, sub_info=None, video_path=None):
+        """Generate FFmpeg filter for converting to vertical format.
+        
+        If sub_info is provided, subtitles are overlaid onto the video first,
+        then the vertical layout is built from the subtitle-composited stream.
+        """
         width, height = map(int, self.output_resolution.split('x'))
         
+        # Determine the source video tag
+        # If subtitles are active, we first overlay them onto [0:v]
+        sub_prefix = ""
+        src_tag = "[0:v]"
+        
+        if sub_info is not None:
+            si = sub_info["sub_index"]
+            codec = sub_info["codec"]
+            
+            if "pgs" in codec or "dvd_sub" in codec or "dvb" in codec:
+                # Image-based subtitles (PGS, DVD, DVB): use overlay
+                sub_prefix = f"[0:v][0:s:{si}]overlay[v_with_subs];"
+            else:
+                # Text-based subtitles (ASS, SRT, etc): subtitles filter needs the file path
+                esc = _escape_subtitle_path(video_path)
+                sub_prefix = f"[0:v]subtitles='{esc}':si={si}[v_with_subs];"
+            
+            src_tag = "[v_with_subs]"
+        
         if self.vertical_format == "none":
+            if sub_info is not None:
+                # Even with no vertical format, we still need to output the sub-overlaid stream
+                return sub_prefix + f"{src_tag}null[out]"
             return None
         
         elif self.vertical_format == "crop":
             # Center crop - zoom in to fill vertical space
-            # Calculate the width needed for 9:16 aspect ratio
             target_width = int(input_height * width / height)
             x_offset = (input_width - target_width) // 2
             
+            if sub_info is not None:
+                return (
+                    sub_prefix +
+                    f"{src_tag}crop={target_width}:{input_height}:{x_offset}:0,"
+                    f"scale={width}:{height}:flags=lanczos[out]"
+                )
             return (
                 f"crop={target_width}:{input_height}:{x_offset}:0,"
                 f"scale={width}:{height}:flags=lanczos"
@@ -146,10 +267,15 @@ class VideoChunker:
         
         elif self.vertical_format == "pad":
             # Add black bars on top and bottom (letterbox)
-            # Scale to fit width, then pad height
             scaled_height = int(input_height * width / input_width)
             y_offset = (height - scaled_height) // 2
             
+            if sub_info is not None:
+                return (
+                    sub_prefix +
+                    f"{src_tag}scale={width}:{scaled_height}:flags=lanczos,"
+                    f"pad={width}:{height}:0:{y_offset}:black[out]"
+                )
             return (
                 f"scale={width}:{scaled_height}:flags=lanczos,"
                 f"pad={width}:{height}:0:{y_offset}:black"
@@ -162,6 +288,21 @@ class VideoChunker:
             # Calculate scaled dimensions to fit the video centered
             scaled_height = int(input_height * width / input_width)
             y_offset = (height - scaled_height) // 2
+            
+            if sub_info is not None:
+                # With subtitles: overlay subs first, then split into bg + fg
+                return (
+                    sub_prefix +
+                    f"{src_tag}split=2[v_bg][v_fg];"
+                    # Create blurred background
+                    f"[v_bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},"
+                    f"gblur=sigma=20[bg];"
+                    # Create foreground
+                    f"[v_fg]scale={width}:{scaled_height}:flags=lanczos[fg];"
+                    # Overlay foreground on blurred background
+                    f"[bg][fg]overlay=0:{y_offset}[out]"
+                )
             
             return (
                 # Create blurred background: scale to fill, blur heavily
@@ -415,29 +556,40 @@ class VideoChunker:
             cut_points[-1] = duration  # absorb a tiny tail into the last chunk
         return cut_points
     
-    def create_chunk(self, video_path, start, end, output_path, input_width, input_height):
-        """Creates a single chunk with optional vertical format conversion"""
+    def create_chunk(self, video_path, start, end, output_path, input_width, input_height, sub_info=None):
+        """Creates a single chunk with optional vertical format conversion and subtitle burn-in"""
         cmd = ["ffmpeg", "-y"]
         
         # Determine if we need to re-encode
-        needs_reencode = self.re_encode or self.vertical_format != "none"
+        needs_reencode = self.re_encode or self.vertical_format != "none" or sub_info is not None
+        has_subs = sub_info is not None
         
-        if needs_reencode and self._hw_decode_args:
-            # Add hardware-accelerated decoding for faster input processing
-            cmd.extend(self._hw_decode_args)
-        
-        cmd.extend([
-            "-ss", str(start),
-            "-i", str(video_path),
-            "-t", str(end - start),
-        ])
+        if has_subs:
+            # When burning subtitles, use -copyts for perfect subtitle sync with fast seek
+            # Order: -ss (fast seek) -> -copyts -> [-hwaccel] -> -i
+            cmd.extend(["-ss", str(start), "-copyts"])
+            if self._hw_decode_args:
+                cmd.extend(self._hw_decode_args)
+            cmd.extend(["-i", str(video_path)])
+        else:
+            if needs_reencode and self._hw_decode_args:
+                # Add hardware-accelerated decoding for faster input processing
+                cmd.extend(self._hw_decode_args)
+            cmd.extend([
+                "-ss", str(start),
+                "-i", str(video_path),
+                "-t", str(end - start),
+            ])
         
         if needs_reencode:
-            # Get vertical format filter if needed
-            video_filter = self.get_vertical_filter(input_width, input_height)
+            # Get vertical format filter (with subtitle overlay if applicable)
+            video_filter = self.get_vertical_filter(input_width, input_height, sub_info=sub_info, video_path=video_path)
             
             if video_filter:
                 cmd.extend(["-filter_complex", video_filter])
+                if has_subs:
+                    # Explicit mapping required when using named filter outputs
+                    cmd.extend(["-map", "[out]", "-map", "0:a:0"])
             
             # Select encoder: GPU or software
             encoder = self._hw_encoder or "libx264"
@@ -492,6 +644,10 @@ class VideoChunker:
                     "-movflags", "+faststart",
                 ])
             
+            if has_subs:
+                # With -copyts: output seek + duration must come after encoder settings
+                cmd.extend(["-ss", str(start), "-t", str(end - start)])
+            
             # Audio settings
             cmd.extend([
                 "-c:a", "aac",
@@ -526,6 +682,13 @@ class VideoChunker:
         _, input_width, input_height = self.get_video_info(video_file)
         print(f"Input resolution: {input_width}x{input_height}")
         
+        # Detect subtitle stream
+        sub_info = self.detect_subtitle_stream(video_file)
+        if sub_info:
+            print(f"Subtitles: [{sub_info['codec']}] {sub_info['title']} (lang={sub_info['lang']}, track=0:s:{sub_info['sub_index']})")
+        else:
+            print("Subtitles: None found or disabled")
+        
         show_name, season, episode = self.extract_show_info(video_file.name)
         cut_points = self.find_cut_points(video_file)
         
@@ -539,6 +702,12 @@ class VideoChunker:
             # More than that will queue or error
             effective_workers = min(self.max_workers, 3)
             print(f"GPU encoding: limiting to {effective_workers} parallel workers")
+        
+        # When burning subtitles with -copyts, limit parallel workers to avoid
+        # multiple FFmpeg instances racing to decode the same subtitle stream
+        if sub_info:
+            effective_workers = min(effective_workers, 2)
+            print(f"Subtitle burning: limiting to {effective_workers} parallel workers")
         
         # Create chunks in parallel
         futures = []
@@ -555,7 +724,7 @@ class VideoChunker:
                 future = executor.submit(
                     self.create_chunk, 
                     video_file, start, end, output_path,
-                    input_width, input_height
+                    input_width, input_height, sub_info
                 )
                 futures.append(future)
 
@@ -587,6 +756,7 @@ class VideoChunker:
         print(f"Strategy: {self.strategy}")
         print(f"Max workers: {self.max_workers}")
         print(f"Encoder: {self._hw_encoder or 'libx264 (software)'}")
+        print(f"Burn subtitles: {self.burn_subtitles} (lang={self.sub_lang})")
         
         for video_file in video_files:
             self.process_single_video(video_file)
@@ -666,6 +836,13 @@ Examples:
     parser.add_argument("--hw-accel", choices=["auto", "nvenc", "qsv", "amf", "none"],
                        default="auto",
                        help="Hardware acceleration method (default: auto)")
+    parser.add_argument("--subtitles", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="Burn in embedded subtitles (default: True, use --no-subtitles to disable)")
+    parser.add_argument("--sub-lang", default="eng",
+                       help="Preferred subtitle language tag (default: eng)")
+    parser.add_argument("--sub-index", type=int, default=None,
+                       help="Manual subtitle stream index override (among subtitle streams, e.g. 0 for first)")
     
     args = parser.parse_args()
     
@@ -678,6 +855,9 @@ Examples:
         args.workers,
         args.vertical,
         args.resolution,
-        args.hw_accel
+        args.hw_accel,
+        args.subtitles,
+        args.sub_lang,
+        args.sub_index
     )
     chunker.process_videos()

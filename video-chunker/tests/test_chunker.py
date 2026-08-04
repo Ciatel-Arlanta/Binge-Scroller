@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from chunker import VideoChunker
+from chunker import VideoChunker, _escape_subtitle_path
 
 
 @pytest.fixture
@@ -88,3 +88,66 @@ class TestFindCutPointsSilence:
         )
         assert len(cuts) >= 2
         assert cuts[1] == 120.0
+
+
+class TestEscapeSubtitlePath:
+    def test_windows_path(self):
+        assert _escape_subtitle_path(r"C:\vids\a.mkv") == r"C\:/vids/a.mkv"
+
+    def test_forward_slashes(self):
+        assert _escape_subtitle_path("C:/vids/a.mkv") == r"C\:/vids/a.mkv"
+
+
+class TestGetVerticalFilterSubtitles:
+    """Filter strings for image vs text subtitle burn-in (no ffmpeg)."""
+
+    @pytest.fixture
+    def blur_chunker(self, tmp_path):
+        return VideoChunker(
+            tmp_path,
+            output_dir=tmp_path / "out",
+            hw_accel="none",
+            target_duration=120,
+            vertical_format="blur",
+            output_resolution="720x1280",
+        )
+
+    def test_text_subs_use_subtitles_filter(self, blur_chunker):
+        sub_info = {
+            "sub_index": 0,
+            "codec": "ass",
+            "lang": "eng",
+            "title": "Full",
+        }
+        filt = blur_chunker.get_vertical_filter(
+            1920,
+            1080,
+            sub_info=sub_info,
+            video_path=r"C:\vids\a.mkv",
+        )
+        assert filt is not None
+        assert "subtitles=" in filt and "si=0" in filt and r"C\:/vids/a.mkv" in filt
+        assert "[0:s:0]overlay" not in filt
+
+    def test_pgs_subs_use_overlay(self, blur_chunker):
+        sub_info = {
+            "sub_index": 0,
+            "codec": "hdmv_pgs_subtitle",
+            "lang": "eng",
+            "title": "PGS",
+        }
+        filt = blur_chunker.get_vertical_filter(
+            1920,
+            1080,
+            sub_info=sub_info,
+            video_path=r"C:\vids\a.mkv",
+        )
+        assert filt is not None
+        assert "[0:s:0]overlay" in filt
+        assert "subtitles=" not in filt
+
+    def test_no_subs_unchanged(self, blur_chunker):
+        filt = blur_chunker.get_vertical_filter(1920, 1080, sub_info=None)
+        assert filt is not None
+        assert "subtitles=" not in filt
+        assert "v_with_subs" not in filt
