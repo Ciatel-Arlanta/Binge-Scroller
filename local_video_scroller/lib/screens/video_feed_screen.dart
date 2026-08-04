@@ -51,6 +51,10 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> with WidgetsBindingOb
         setState(() {
           _isAppInBackground = false;
         });
+        // User may have granted permission in system settings.
+        if (!_hasPermission) {
+          _checkPermissions();
+        }
         break;
       case AppLifecycleState.detached:
         break;
@@ -60,14 +64,26 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> with WidgetsBindingOb
   Future<void> _checkPermissions() async {
     var status = await Permission.videos.request();
     if (status.isDenied) {
+      // Android <=12 maps videos to storage; try legacy storage next.
       status = await Permission.storage.request();
     }
-    if (status.isGranted) {
-      setState(() {
-        _hasPermission = true;
-      });
-    } else {
+
+    if (status.isGranted || status.isLimited) {
+      if (mounted) {
+        setState(() {
+          _hasPermission = true;
+        });
+      }
+      return;
+    }
+
+    if (status.isPermanentlyDenied) {
       _showPermissionDeniedDialog();
+    } else if (mounted) {
+      // Soft deny: keep the grant button on the permission screen.
+      setState(() {
+        _hasPermission = false;
+      });
     }
   }
 
@@ -83,7 +99,14 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> with WidgetsBindingOb
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text('OK'),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                openAppSettings();
+              },
+              child: const Text('Open Settings'),
             ),
           ],
         );
