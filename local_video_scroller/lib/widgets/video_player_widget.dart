@@ -78,31 +78,49 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
   }
 
   Future<void> _initializeVideo() async {
+    VideoPlayerController? controller;
     try {
       _hasEnded = false;
-      _controller = VideoPlayerController.file(
+      controller = VideoPlayerController.file(
         File(widget.video.path),
         videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
       );
+      _controller = controller;
 
-      await _controller!.initialize();
-      await _controller!.setVolume(1.0);
+      await controller.initialize();
+      // Bail if disposed or a newer init replaced this controller mid-await.
+      // Do not dispose here: _disposeController already owns teardown and
+      // would double-dispose if we disposed the same instance again.
+      if (!mounted || _isDisposed || _controller != controller) {
+        return;
+      }
 
-      _controller!.addListener(_onControllerUpdate);
+      await controller.setVolume(1.0);
+      if (!mounted || _isDisposed || _controller != controller) {
+        return;
+      }
 
-      if (!_isDisposed) {
+      controller.addListener(_onControllerUpdate);
+
+      if (!_isDisposed && mounted && _controller == controller) {
         setState(() {
           _isInitialized = true;
         });
       }
 
       // Re-check autoPlay after async init — user may have scrolled away
-      if (widget.autoPlay && !_shouldPause && !_isDisposed) {
-        await _controller!.play();
+      if (widget.autoPlay &&
+          !_shouldPause &&
+          !_isDisposed &&
+          mounted &&
+          _controller == controller) {
+        await controller.play();
       }
     } catch (e) {
       print('Error initializing video: $e');
-      if (!_isDisposed) {
+      if (!_isDisposed && mounted &&
+          controller != null &&
+          _controller == controller) {
         setState(() {
           _hasError = true;
         });
@@ -118,6 +136,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
       _controller = null;
       _isInitialized = false;
       _hasError = false;
+      _hasEnded = false;
     }
   }
 
@@ -306,29 +325,36 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
                 ),
               ),
 
-            // Video title (shown when paused)
-            if (!_controller!.value.isPlaying)
-              Positioned(
-                bottom: 80, // Moved up to make room for progress bar
-                left: 0,
-                right: 0,
-                child: Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      widget.video.displayName,
-                      style: const TextStyle(color: Colors.white),
+            // Video title (shown when paused) — reactive to controller ticks
+            ValueListenableBuilder<VideoPlayerValue>(
+              valueListenable: _controller!,
+              builder: (context, value, child) {
+                if (value.isPlaying) {
+                  return const SizedBox.shrink();
+                }
+                return Positioned(
+                  bottom: 80, // Moved up to make room for progress bar
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        widget.video.displayName,
+                        style: const TextStyle(color: Colors.white),
+                      ),
                     ),
                   ),
-                ),
-              ),
+                );
+              },
+            ),
 
             // Progress bar and time display
             Positioned(
@@ -353,10 +379,13 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
                     ValueListenableBuilder<VideoPlayerValue>(
                       valueListenable: _controller!,
                       builder: (context, value, child) {
+                        final durMs = value.duration.inMilliseconds;
+                        final progress = durMs > 0
+                            ? (value.position.inMilliseconds / durMs)
+                                .clamp(0.0, 1.0)
+                            : 0.0;
                         return LinearProgressIndicator(
-                          value:
-                              value.position.inSeconds /
-                              value.duration.inSeconds,
+                          value: progress,
                           backgroundColor: Colors.white24,
                           valueColor: const AlwaysStoppedAnimation<Color>(
                             Colors.red,
