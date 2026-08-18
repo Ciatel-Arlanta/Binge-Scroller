@@ -6,5 +6,8 @@ Processed_Output/
 # plans/ tracked (implementation + design docs)
 .agents/
 .claude/
+.serena/
 .tokensave/
 skills-lock.json
+__pycache__/
+*.pyc

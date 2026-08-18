@@ -20,7 +20,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Local Video Scroller',
+      title: 'Binge Scroller',
       theme: ThemeData.dark(), // Dark theme usually looks better for video apps
       home: const VideoFeedScreen(),
     );

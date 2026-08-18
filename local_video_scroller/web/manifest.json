@@ -1,6 +1,6 @@
 {
-    "name": "local_video_scroller",
-    "short_name": "local_video_scroller",
+    "name": "Binge Scroller",
+    "short_name": "Binge Scroller",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
